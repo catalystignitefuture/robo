@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Talk</title>
+<style>
+  :root { --bg:#10161c; --panel:#18222b; --line:#2b3a47; --ink:#e8f1f7; --dim:#8ba0b0; --accent:#35d0ba; --warn:#ff7a59; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body { background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,"Segoe UI",Roboto,sans-serif; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line); }
+  h1 { font-size:1.05rem; margin:0; font-weight:600; }
+  #status { color:var(--dim); font-size:.9rem; }
+  #status.ok { color:var(--accent); }
+  main { flex:1; display:flex; flex-direction:column; min-height:0; }
+  #setup { margin:auto; width:min(420px,92vw); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px; }
+  #setup label { display:block; margin:12px 0 4px; color:var(--dim); font-size:.9rem; }
+  input,button,select { font:inherit; color:var(--ink); background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  input:focus-visible,button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  #setup input { width:100%; }
+  .roles { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:16px; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); color:#06231e; border-color:var(--accent); font-weight:600; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #call { display:none; flex:1; flex-direction:column; min-height:0; }
+  #feed { flex:1; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:85%; padding:10px 14px; border-radius:12px; background:var(--panel); border:1px solid var(--line); }
+  .msg.me { align-self:flex-end; border-color:var(--accent); }
+  .msg small { display:block; color:var(--dim); font-size:.75rem; }
+  body.display #feed { justify-content:center; align-items:center; text-align:center; }
+  body.display .msg { max-width:95%; font-size:clamp(2rem,7vw,5rem); line-height:1.15; background:none; border:none; }
+  body.display .msg small { display:none; }
+  body.display .msg:not(:last-child) { display:none; }
+  #bar { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); flex-wrap:wrap; }
+  #text { flex:1; min-width:160px; }
+  #bar .tools { display:flex; gap:8px; flex-wrap:wrap; }
+  button.off { background:var(--warn); border-color:var(--warn); color:#2b0e05; }
+  #err { color:var(--warn); margin-top:12px; min-height:1.4em; font-size:.9rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Robot Talk</h1>
+  <span id="status">Not connected</span>
+</header>
+
+<main>
+  <section id="setup">
+    <label for="code">Room code (same on both sides)</label>
+    <input id="code" placeholder="e.g. robot42" autocomplete="off" maxlength="24">
+    <div class="roles">
+      <button id="btnRobot" class="primary">Start as robot</button>
+      <button id="btnOperator">Join as operator</button>
+    </div>
+    <div id="err" role="alert"></div>
+  </section>
+
+  <section id="call">
+    <div id="feed" aria-live="polite"></div>
+    <div id="bar">
+      <input id="text" placeholder="Type a message and press Enter" autocomplete="off">
+      <div class="tools">
+        <button id="send" class="primary">Send</button>
+        <button id="mute">Mute mic</button>
+        <button id="speak">Read aloud: off</button>
+        <button id="mode">Big text view</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<audio id="remote" autoplay playsinline></audio>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+let peer, conn, localStream, role, readAloud = false;
+
+function setStatus(t, ok){ const s=$('status'); s.textContent=t; s.className = ok ? 'ok' : ''; }
+function showErr(t){ $('err').textContent = t; }
+
+function addMsg(text, mine){
+  const d = document.createElement('div');
+  d.className = 'msg' + (mine ? ' me' : '');
+  const who = document.createElement('small');
+  who.textContent = mine ? 'You' : (role === 'robot' ? 'Operator' : 'Robot');
+  const body = document.createElement('span');
+  body.textContent = text;
+  d.append(who, body);
+  $('feed').append(d);
+  $('feed').scrollTop = $('feed').scrollHeight;
+  if (!mine && readAloud && 'speechSynthesis' in window) {
+    speechSynthesis.cancel();
+    speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  }
+}
+
+function wireData(c){
+  conn = c;
+  c.on('open', () => setStatus('Connected', true));
+  c.on('data', d => addMsg(String(d), false));
+  c.on('close', () => setStatus('Peer left'));
+}
+
+function wireCall(call){
+  call.answer && 0;
+  call.on('stream', s => { $('remote').srcObject = s; setStatus('Connected', true); });
+  call.on('close', () => setStatus('Peer left'));
+}
+
+async function start(r){
+  role = r;
+  const room = $('code').value.trim().toLowerCase().replace(/[^a-z0-9-]/g,'');
+  if (!room) { showErr('Enter a room code first.'); return; }
+  showErr('');
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true }, video:false
+    });
+  } catch (e) {
+    showErr('Microphone blocked. Allow mic access, and open this page over https:// or http://localhost.');
+    return;
+  }
+  const robotId = 'robot-talk-' + room;
+  peer = r === 'robot' ? new Peer(robotId) : new Peer();
+
+  peer.on('error', e => {
+    if (e.type === 'unavailable-id') showErr('That room code is already in use. Pick another.');
+    else if (e.type === 'peer-unavailable') showErr('Robot not found. Start the robot side first with the same code.');
+    else showErr('Connection error: ' + e.type);
+    setStatus('Error');
+  });
+
+  peer.on('open', () => {
+    $('setup').style.display = 'none';
+    $('call').style.display = 'flex';
+    if (r === 'robot') {
+      document.body.classList.add('display');
+      $('mode').textContent = 'Chat view';
+      setStatus('Waiting for operator…');
+    } else {
+      setStatus('Connecting…');
+      const call = peer.call(robotId, localStream);
+      wireCall(call);
+      wireData(peer.connect(robotId, { reliable:true }));
+    }
+  });
+
+  if (r === 'robot') {
+    peer.on('call', call => { call.answer(localStream); wireCall(call); });
+    peer.on('connection', wireData);
+  }
+}
+
+function send(){
+  const t = $('text').value.trim();
+  if (!t || !conn || !conn.open) return;
+  conn.send(t);
+  addMsg(t, true);
+  $('text').value = '';
+}
+
+$('btnRobot').onclick = () => start('robot');
+$('btnOperator').onclick = () => start('operator');
+$('send').onclick = send;
+$('text').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+$('mute').onclick = () => {
+  const track = localStream.getAudioTracks()[0];
+  track.enabled = !track.enabled;
+  $('mute').textContent = track.enabled ? 'Mute mic' : 'Unmute mic';
+  $('mute').classList.toggle('off', !track.enabled);
+};
+$('speak').onclick = () => {
+  readAloud = !readAloud;
+  $('speak').textContent = 'Read aloud: ' + (readAloud ? 'on' : 'off');
+};
+$('mode').onclick = () => {
+  const on = document.body.classList.toggle('display');
+  $('mode').textContent = on ? 'Chat view' : 'Big text view';
+};
+</script>
+</body>
+</html>
